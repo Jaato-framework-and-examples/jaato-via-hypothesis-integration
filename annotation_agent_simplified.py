@@ -5,12 +5,16 @@ The ws_client plugin manages the WebSocket lifecycle (connect, subscribe, reconn
 reader thread, message delivery). This adapter only handles:
 
   1. Posting replies via the Hypothesis REST API
-  2. Bridging Jaato permission/clarification events through annotation threads
+  2. Auto-approving tool permissions (controlled environment)
   3. Filtering/routing incoming annotation messages
+
+Clarification is not used — this is a non-interactive agent that works with
+what it has. Permissions are auto-approved programmatically.
 
 Usage:
     1. Ensure the Hypothesis stack is running (docker compose up)
-    2. Ensure the jaato server is running with the hypothesis-annotation-agent profile
+    2. Start the jaato server with the profile:
+       python -m server --profile hypothesis-annotation-agent --daemon
     3. Run: python annotation_agent_simplified.py
 """
 
@@ -27,7 +31,6 @@ from dotenv import load_dotenv
 from jaato_sdk import IPCRecoveryClient
 from jaato_sdk.events import (
     AgentOutputEvent,
-    ClarificationInputModeEvent,
     ErrorEvent,
     ExternalEvent,
     PermissionInputModeEvent,
@@ -91,46 +94,6 @@ def build_prompt(ann: dict, repo_url: str | None) -> str:
     return "\n".join(parts)
 
 
-async def wait_for_user_reply(ann_id: str, client: IPCRecoveryClient,
-                              timeout: float = 300.0) -> str | None:
-    """Wait for a user reply to annotation *ann_id* via ExternalEvent.
-
-    The ws_client plugin delivers incoming WebSocket messages as ExternalEvent
-    instances.  We consume events until we find a reply annotation whose
-    ``references`` array contains *ann_id*, or until *timeout* seconds elapse.
-
-    Returns the reply text, or None on timeout.
-    """
-    try:
-        reply_text = await asyncio.wait_for(
-            _scan_for_reply(ann_id, client), timeout=timeout
-        )
-        return reply_text
-    except asyncio.TimeoutError:
-        log.warning("Timed out waiting for user reply to %s", ann_id)
-        return None
-
-
-async def _scan_for_reply(ann_id: str, client: IPCRecoveryClient) -> str:
-    """Iterate ExternalEvents until a reply referencing *ann_id* arrives."""
-    async for event in client.events():
-        if not isinstance(event, ExternalEvent):
-            continue
-        msg = json.loads(event.data) if isinstance(event.data, str) else event.data
-        if msg.get("type") != "annotation-notification":
-            continue
-        action = msg.get("options", {}).get("action")
-        if action == "delete":
-            continue
-        for reply_ann in msg.get("payload", []):
-            if "jaato-annotation-agent" in reply_ann.get("tags", []):
-                continue
-            refs = reply_ann.get("references", [])
-            if ann_id in refs:
-                return reply_ann.get("text", "")
-    return ""
-
-
 async def process_annotation(ann: dict, h: HypothesisClient, client: IPCRecoveryClient):
     """Send annotation to Jaato agent and post the reply."""
     ann_id = ann["id"]
@@ -138,8 +101,7 @@ async def process_annotation(ann: dict, h: HypothesisClient, client: IPCRecovery
     log.info("Processing annotation %s: %s", ann_id, instruction[:80])
 
     # Repo discovery is delegated to the agent via web_fetch plugin + system prompt.
-    # For deterministic behavior, we still extract it here if available.
-    repo_url = None  # Agent discovers via web_fetch if needed
+    repo_url = None
 
     prompt = build_prompt(ann, repo_url)
     await client.send_message(prompt)
@@ -151,33 +113,14 @@ async def process_annotation(ann: dict, h: HypothesisClient, client: IPCRecovery
             parts.append(event.text)
 
         elif isinstance(event, PermissionInputModeEvent):
-            # Post intermediate output, then auto-approve (agent runs in a
-            # controlled environment with limited tool access).
+            # Auto-approve — agent runs in a controlled environment with
+            # limited tool access (cli, file_edit, web_fetch).
             text = "".join(parts)
             text = re.sub(r"\n*Tool: ", "\n\nTool: ", text, count=1)
             if text:
                 h.create_reply(ann, text)
                 parts.clear()
             await client.respond_to_permission(event.request_id, "comment")
-
-        elif isinstance(event, ClarificationInputModeEvent):
-            # Post the clarification question as a reply, then wait for the
-            # user to respond via a new annotation in the thread.  The user's
-            # reply arrives as an ExternalEvent from the ws_client plugin.
-            text = "".join(parts)
-            if text:
-                reply = h.create_reply(ann, text)
-                parts.clear()
-                reply_id = reply["id"]
-            else:
-                reply_id = ann_id
-
-            user_reply = await wait_for_user_reply(reply_id, client)
-            if user_reply is not None:
-                log.info("Got user reply for clarification: %s", user_reply[:120])
-                await client.respond_to_clarification(event.request_id, user_reply)
-            else:
-                await client.respond_to_clarification(event.request_id, "(no reply — timed out)")
 
         elif isinstance(event, ErrorEvent):
             log.error("Agent error: %s", event)
@@ -216,8 +159,8 @@ async def main():
     log.info("Connected to jaato server, session %s", session_id)
 
     # The ws_client plugin connects to the Hypothesis WebSocket automatically
-    # (configured in the profile).  We send the subscription filter via ws_send
-    # as the first agent action — or it can be done in the system prompt.
+    # (configured in the profile).  The subscription filter is sent via the
+    # system prompt on session start.
 
     try:
         async for event in client.events():

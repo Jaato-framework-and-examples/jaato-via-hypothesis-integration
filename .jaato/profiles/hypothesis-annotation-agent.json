@@ -1,6 +1,6 @@
 {
   "name": "hypothesis-annotation-agent",
-  "description": "Daemon that listens for Hypothesis annotations via WebSocket and replies using an LLM with access to the source repository",
+  "description": "Daemon that listens for Hypothesis annotations via WebSocket and replies using an LLM with access to the source repository (used with the thin Python adapter)",
   "mode": "daemon",
   "plugins": ["ws_client(preload)", "cli", "file_edit", "web_fetch"],
   "plugin_configs": {
