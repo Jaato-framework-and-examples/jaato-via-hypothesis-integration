@@ -91,6 +91,46 @@ def build_prompt(ann: dict, repo_url: str | None) -> str:
     return "\n".join(parts)
 
 
+async def wait_for_user_reply(ann_id: str, client: IPCRecoveryClient,
+                              timeout: float = 300.0) -> str | None:
+    """Wait for a user reply to annotation *ann_id* via ExternalEvent.
+
+    The ws_client plugin delivers incoming WebSocket messages as ExternalEvent
+    instances.  We consume events until we find a reply annotation whose
+    ``references`` array contains *ann_id*, or until *timeout* seconds elapse.
+
+    Returns the reply text, or None on timeout.
+    """
+    try:
+        reply_text = await asyncio.wait_for(
+            _scan_for_reply(ann_id, client), timeout=timeout
+        )
+        return reply_text
+    except asyncio.TimeoutError:
+        log.warning("Timed out waiting for user reply to %s", ann_id)
+        return None
+
+
+async def _scan_for_reply(ann_id: str, client: IPCRecoveryClient) -> str:
+    """Iterate ExternalEvents until a reply referencing *ann_id* arrives."""
+    async for event in client.events():
+        if not isinstance(event, ExternalEvent):
+            continue
+        msg = json.loads(event.data) if isinstance(event.data, str) else event.data
+        if msg.get("type") != "annotation-notification":
+            continue
+        action = msg.get("options", {}).get("action")
+        if action == "delete":
+            continue
+        for reply_ann in msg.get("payload", []):
+            if "jaato-annotation-agent" in reply_ann.get("tags", []):
+                continue
+            refs = reply_ann.get("references", [])
+            if ann_id in refs:
+                return reply_ann.get("text", "")
+    return ""
+
+
 async def process_annotation(ann: dict, h: HypothesisClient, client: IPCRecoveryClient):
     """Send annotation to Jaato agent and post the reply."""
     ann_id = ann["id"]
@@ -121,17 +161,23 @@ async def process_annotation(ann: dict, h: HypothesisClient, client: IPCRecovery
             await client.respond_to_permission(event.request_id, "comment")
 
         elif isinstance(event, ClarificationInputModeEvent):
-            # Post the clarification question as a reply.  In a full
-            # interactive setup this would wait for the user's annotation
-            # reply via the WebSocket — but that reply now arrives as an
-            # ExternalEvent from the ws_client plugin.  For now, we skip
-            # the interactive loop and let the agent proceed with best-effort.
+            # Post the clarification question as a reply, then wait for the
+            # user to respond via a new annotation in the thread.  The user's
+            # reply arrives as an ExternalEvent from the ws_client plugin.
             text = "".join(parts)
             if text:
-                h.create_reply(ann, text)
+                reply = h.create_reply(ann, text)
                 parts.clear()
-            # TODO: wait for user reply via ExternalEvent correlation
-            await client.respond_to_clarification(event.request_id, "(no reply)")
+                reply_id = reply["id"]
+            else:
+                reply_id = ann_id
+
+            user_reply = await wait_for_user_reply(reply_id, client)
+            if user_reply is not None:
+                log.info("Got user reply for clarification: %s", user_reply[:120])
+                await client.respond_to_clarification(event.request_id, user_reply)
+            else:
+                await client.respond_to_clarification(event.request_id, "(no reply — timed out)")
 
         elif isinstance(event, ErrorEvent):
             log.error("Agent error: %s", event)

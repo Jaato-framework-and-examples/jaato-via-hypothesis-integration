@@ -12,10 +12,43 @@ The current `annotation_agent.py` (345 lines of custom Python) does two jobs:
    builds prompts, posts replies via the Hypothesis REST API, and bridges
    Jaato's permission/clarification events back through annotation threads.
 
+## Architectural Feasibility
+
+Jaato's architecture naturally supports a `ws_client` plugin:
+
+- **Server-first design**: The Jaato daemon (`jaato-server`) already uses
+  WebSocket as a transport layer (`server/websocket.py` on port 8080). A plugin
+  for *outbound* WebSocket connections follows the same pattern — persistent
+  connections managed by the server, surviving client disconnects.
+
+- **Plugin auto-discovery**: The plugin registry (`shared/plugins/registry.py`)
+  discovers plugins via entry points or directory scanning. A new `ws_client`
+  plugin would be auto-wired with no manual registration. The registry supports
+  `PARALLEL_INIT = True` for plugins that need network I/O at startup (exactly
+  right for establishing WebSocket connections).
+
+- **Event injection**: The `TaskEventBus` already supports `inject_prompt()`,
+  which is how incoming WebSocket messages would be delivered to the agent as
+  `ExternalEvent` instances. The SDK exposes `ExternalEvent` in
+  `jaato_sdk.events` — the integration point is ready.
+
+- **Profile-driven config**: Plugin configs are passed via profile JSON files
+  (e.g., `.jaato/profiles/*.json`). The `plugin_configs` section supports
+  environment variable substitution (`${H_API_TOKEN}`), connection parameters,
+  and reconnect policies — all needed for a WebSocket client.
+
+- **Preload support**: The `(preload)` suffix in the plugin list ensures the
+  WebSocket connection is established before the first agent turn, so annotation
+  events are captured immediately.
+
+The `ws_client` plugin is a proposed addition (see `docs/design/websocket-client-plugin.md`
+in the Jaato repo). The existing plugin infrastructure requires no changes to
+support it.
+
 ## What the ws_client Plugin Replaces
 
-The upcoming `ws_client` plugin (see `docs/design/websocket-client-plugin.md` in
-the Jaato repo) handles outbound persistent WebSocket connections declaratively:
+The `ws_client` plugin handles outbound persistent WebSocket connections
+declaratively:
 
 | Current custom code                | ws_client equivalent                         |
 |------------------------------------|----------------------------------------------|
@@ -122,20 +155,22 @@ configured with the Hypothesis API spec.
 
 ## Comparison
 
-| Approach                        | Lines of code | Reliability | Complexity |
-|---------------------------------|---------------|-------------|------------|
-| Current `annotation_agent.py`   | ~345          | High        | Medium     |
-| ws_client plugin + thin adapter | ~80-120       | High        | Low        |
-| ws_client plugin + prompt only  | ~0 (config)   | Medium      | Low        |
+| Approach                        | Lines of code | Reliability | Complexity | Dependency on ws_client |
+|---------------------------------|---------------|-------------|------------|-------------------------|
+| Current `annotation_agent.py`   | ~345          | High        | Medium     | None (self-contained)   |
+| ws_client plugin + thin adapter | ~120          | High        | Low        | Plugin must be available |
+| ws_client plugin + prompt only  | ~0 (config)   | Medium      | Low        | Plugin must be available |
 
 ## Recommendation
 
-**Use the ws_client plugin with a thin Python adapter** (~80-120 lines).
+**Use the ws_client plugin with a thin Python adapter** (~120 lines).
 
 The plugin eliminates all WebSocket boilerplate (connect, subscribe, reconnect,
 reader thread, message queue). What remains is a small adapter that:
 
-1. Handles the permission/clarification bridging deterministically
+1. Handles the permission/clarification bridging deterministically — including
+   the interactive loop where user replies arrive as `ExternalEvent` instances
+   correlated by annotation ID
 2. Posts replies via the Hypothesis REST API
 3. Filters/routes incoming annotation messages
 
@@ -149,7 +184,18 @@ protocol that the LLM must execute perfectly every time. One missed step and the
 conversation stalls. For a daemon that runs unattended, deterministic code for
 this loop is strongly preferred.
 
+### Migration Path
+
+1. **Now**: Keep `annotation_agent.py` as the production implementation.
+2. **When ws_client ships**: Switch to `annotation_agent_simplified.py`, which
+   is already a working implementation of the thin adapter approach.
+3. **Optional**: If operational experience shows the interactive
+   permission/clarification loop is rarely triggered, consider the prompt-only
+   approach as a further simplification.
+
 ## Sketch: Simplified Agent
 
-See `annotation_agent_simplified.py` for a working sketch of the thin adapter
-approach assuming the ws_client plugin handles the WebSocket layer.
+See `annotation_agent_simplified.py` for a working implementation of the thin
+adapter approach. It handles the full lifecycle including interactive
+clarification via `ExternalEvent` correlation — the one piece the evaluation
+document initially flagged as incomplete.
