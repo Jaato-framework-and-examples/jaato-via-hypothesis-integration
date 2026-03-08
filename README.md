@@ -40,8 +40,8 @@ All upstream source code is cloned from GitHub during `docker build` — nothing
 ## Quick Start
 
 ```bash
-git clone https://github.com/Jaato-framework-and-examples/jaato-via-integration.git
-cd jaato-via-integration
+git clone https://github.com/Jaato-framework-and-examples/jaato-via-hypothesis-integration.git
+cd jaato-via-hypothesis-integration
 ./start.sh
 ```
 
@@ -84,7 +84,17 @@ Copy the returned UUID into `CLIENT_OAUTH_ID` in `.env.template`, then re-run `.
 
 ## Annotation Agent
 
-The agent polls the Hypothesis API for new annotations and replies using a Jaato-connected LLM. It discovers the source repository behind annotated pages via `<link rel="vcs-git">` tags.
+The agent polls the Hypothesis API for new annotations and replies using a Jaato-connected LLM.
+
+### Source Repository Discovery
+
+For the agent to read and propose edits to the source code behind annotated pages, those pages must include a `<link rel="vcs-git">` tag in their HTML `<head>`:
+
+```html
+<link rel="vcs-git" href="https://github.com/your-org/your-repo">
+```
+
+When the agent processes an annotation, it fetches the annotated page and looks for this tag to locate the backing repository. If the tag is missing, the agent can still reply to annotations but won't have access to the source code — it will only see the page content quoted in the annotation.
 
 ### Setup
 
