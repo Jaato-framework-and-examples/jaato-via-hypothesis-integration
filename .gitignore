@@ -1,0 +1,5 @@
+repos/
+.env
+.venv/
+.jaato/
+__pycache__/

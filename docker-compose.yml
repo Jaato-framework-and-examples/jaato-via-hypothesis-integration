@@ -1,0 +1,146 @@
+services:
+  # --- Infrastructure ---
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init-postgres.sh:/docker-entrypoint-initdb.d/init-postgres.sh
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  elasticsearch:
+    build:
+      context: .
+      dockerfile: Dockerfile.elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms256m -Xmx256m"
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  rabbit:
+    image: rabbitmq:3.12-alpine
+    ports:
+      - "5672:5672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # --- Application Services ---
+
+  h:
+    image: hypothesis/hypothesis:20260216-g4352007
+    depends_on:
+      postgres:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      rabbit:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      ELASTICSEARCH_URL: ${ELASTICSEARCH_URL}
+      BROKER_URL: ${BROKER_URL}
+      APP_URL: ${APP_URL}
+      AUTHORITY: ${AUTHORITY}
+      SECRET_KEY: ${SECRET_KEY}
+      H_API_AUTH_COOKIE_SECRET_KEY: ${H_API_AUTH_COOKIE_SECRET_KEY}
+      H_API_AUTH_COOKIE_SALT: ${H_API_AUTH_COOKIE_SALT}
+      CLIENT_URL: ${CLIENT_URL}
+      WEBSOCKET_URL: ${WEBSOCKET_URL}
+      CLIENT_RPC_ALLOWED_ORIGINS: ${CLIENT_RPC_ALLOWED_ORIGINS}
+      CLIENT_OAUTH_ID: ${CLIENT_OAUTH_ID}
+      ENABLE_NGINX: "true"
+      ENABLE_WEB: "true"
+      ENABLE_WEBSOCKET: "false"
+      ENABLE_WEBSOCKET_MONOLITHIC: "true"
+      ENABLE_WORKER: "true"
+      WEB_NUM_WORKERS: "2"
+      WEBSOCKET_NUM_WORKERS: "2"
+    ports:
+      - "5000:5000"
+
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    environment:
+      ASSET_ROOT_URL: ${ASSET_ROOT_URL}
+      H_URL: ${H_URL}
+    ports:
+      - "3001:3001"
+
+  via:
+    build:
+      context: .
+      dockerfile: Dockerfile.via
+    depends_on:
+      postgres:
+        condition: service_healthy
+      h:
+        condition: service_started
+      viahtml:
+        condition: service_started
+    environment:
+      DATABASE_URL: ${VIA_DATABASE_URL}
+      CHECKMATE_URL: ${VIA_CHECKMATE_URL}
+      CHECKMATE_API_KEY: ${VIA_CHECKMATE_API_KEY}
+      CHECKMATE_ALLOW_ALL: ${VIA_CHECKMATE_ALLOW_ALL}
+      VIA_SECRET: ${VIA_SECRET}
+      NGINX_SECURE_LINK_SECRET: ${VIA_NGINX_SECURE_LINK_SECRET}
+      NGINX_SERVER: ${VIA_NGINX_SERVER}
+      CLIENT_EMBED_URL: ${VIA_CLIENT_EMBED_URL}
+      VIA_HTML_URL: ${VIA_HTML_URL}
+      DATA_DIRECTORY: ${VIA_DATA_DIRECTORY}
+      ENABLE_FRONT_PAGE: ${VIA_ENABLE_FRONT_PAGE}
+      API_JWT_SECRET: ${VIA_API_JWT_SECRET}
+    volumes:
+      - ./resolver.conf:/etc/nginx/includes/resolver.conf:ro
+      - ./google_drive_credentials.json:/via-data/google_drive_credentials.json:ro
+      - ./google_drive_resource_keys.json:/via-data/google_drive_resource_keys.json:ro
+      - via-data:/via-data
+    ports:
+      - "9083:9083"
+
+  viahtml:
+    build:
+      context: .
+      dockerfile: Dockerfile.viahtml
+    depends_on:
+      h:
+        condition: service_started
+    environment:
+      VIA_H_EMBED_URL: ${VIAHTML_H_EMBED_URL}
+      VIA_ROUTING_HOST: ${VIAHTML_ROUTING_HOST}
+      CHECKMATE_URL: ${VIAHTML_CHECKMATE_URL}
+      CHECKMATE_API_KEY: ${VIAHTML_CHECKMATE_API_KEY}
+      CHECKMATE_ALLOW_ALL: ${VIAHTML_CHECKMATE_ALLOW_ALL}
+      VIA_SECRET: ${VIAHTML_SECRET}
+      VIA_ALLOWED_REFERRERS: ${VIA_ALLOWED_REFERRERS}
+      VIA_IGNORE_PREFIXES: ${VIA_IGNORE_PREFIXES}
+    ports:
+      - "9085:9085"
+
+volumes:
+  pgdata:
+  esdata:
+  via-data:

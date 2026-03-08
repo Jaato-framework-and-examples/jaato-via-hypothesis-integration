@@ -1,0 +1,3 @@
+jaato-sdk
+requests
+python-dotenv

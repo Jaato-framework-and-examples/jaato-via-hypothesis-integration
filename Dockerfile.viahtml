@@ -1,0 +1,43 @@
+# Mirrors the upstream hypothesis/viahtml Dockerfile
+# https://github.com/hypothesis/viahtml/blob/main/Dockerfile
+FROM python:3.11.11-alpine3.19
+LABEL maintainer="Hypothes.is Project and contributors"
+
+RUN apk add --no-cache nginx supervisor build-base libffi-dev openssl-dev git
+
+RUN addgroup -S hypothesis && adduser -S -G hypothesis -h /var/lib/hypothesis hypothesis
+WORKDIR /var/lib/hypothesis
+
+RUN chown -R hypothesis:hypothesis /var/log/nginx /var/lib/nginx
+
+# Clone viahtml (pin to a specific commit for reproducibility)
+ARG VIAHTML_REF=main
+RUN git clone --depth 1 --branch "$VIAHTML_REF" https://github.com/hypothesis/viahtml.git /tmp/viahtml
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -U pip \
+    && pip install --no-cache-dir -r /tmp/viahtml/requirements/requirements.txt \
+    && pip install --no-cache-dir gevent==24.2.1 greenlet==3.1.0
+
+# Copy app into workdir
+RUN cp -a /tmp/viahtml/. /var/lib/hypothesis/ && rm -rf /tmp/viahtml
+
+# Copy nginx config
+RUN cp conf/nginx/nginx.conf /etc/nginx/nginx.conf \
+    && cp -r conf/nginx/viahtml /etc/nginx/viahtml
+
+# Patch head_insert template: strip target="_blank" so links stay within the proxy
+COPY head_insert.html viahtml/templates/head_insert.html
+
+# Build static assets
+RUN python bin/build_static.py \
+    && python -m whitenoise.compress --no-brotli static
+
+# Ensure workdir writable by hypothesis user (must be after all copies)
+RUN chown -R hypothesis:hypothesis /var/lib/hypothesis
+
+USER hypothesis
+
+EXPOSE 9085
+
+CMD ["/usr/bin/supervisord", "-c", "/var/lib/hypothesis/conf/supervisord.conf"]

@@ -1,0 +1,119 @@
+{% autoescape false %}
+<!-- WB Insert -->
+
+{#
+Hypothesis
+----------
+
+This file is copied directly from `pywb/templates/head_insert.html`
+
+The reason we change this file is to add 'ignore_prefixes' which is read here:
+https://github.com/webrecorder/wombat/blob/3f04dcdcb071042d498c4912599454a15c11f0e4/src/wombat.js#L52
+
+#}
+
+<script>
+{% set urlsplit = cdx.url | urlsplit %}
+  wbinfo = {};
+  wbinfo.top_url = "{{ top_url }}";
+{% if is_framed %}
+  // Fast Top-Frame Redirect
+  if (window == window.top && wbinfo.top_url) {
+    var loc = window.location.href.replace(window.location.hash, "");
+    loc = decodeURI(loc);
+
+    if (loc != decodeURI(wbinfo.top_url)) {
+        window.location.href = wbinfo.top_url + window.location.hash;
+    }
+  }
+{% endif %}
+  {#- Hypothesis edit starts -#}
+  wbinfo.ignore_prefixes = {{ ignore_prefixes | tojson }};
+  {#- Hypothesis edit ends -#}
+
+  wbinfo.url = "{{ cdx.url }}";
+  wbinfo.timestamp = "{{ cdx.timestamp }}";
+  wbinfo.request_ts = "{{ wb_url.timestamp }}";
+  wbinfo.prefix = decodeURI("{{ wb_prefix }}");
+  wbinfo.mod = "{{ replay_mod }}";
+  wbinfo.is_framed = {{ is_framed | tobool }};
+  wbinfo.is_live = {{ is_live | tobool }};
+  wbinfo.coll = "{{ coll }}";
+  wbinfo.proxy_magic = "{{ env.pywb_proxy_magic }}";
+  wbinfo.static_prefix = "{{ static_prefix }}/";
+  wbinfo.enable_auto_fetch = {{ config.enable_auto_fetch | tobool }};
+  wbinfo.target_frame = "___wb_replay_top_frame";
+
+  // Capture the real location.search BEFORE Wombat overrides window.location.
+  // Wombat replaces location with the original proxied URL (which has no via.* params).
+  window.__viaRealSearch = window.location.search;
+</script>
+{% if env.pywb_proxy_magic %}
+{% set whichWombat = 'wombatProxyMode.js' %}
+{% else %}
+{% set whichWombat = 'wombat.js' %}
+{% endif %}
+{% if not wb_url.is_banner_only or (env.pywb_proxy_magic and (config.enable_auto_fetch or config.proxy.enable_wombat)) %}
+<script src='{{ static_prefix }}/{{ whichWombat }}'> </script>
+<script>
+  wbinfo.wombat_ts = "{{ wombat_ts }}";
+  wbinfo.wombat_sec = "{{ wombat_sec }}";
+  wbinfo.wombat_scheme = "{{ urlsplit.scheme }}";
+  wbinfo.wombat_host = "{{ urlsplit.netloc }}";
+
+  wbinfo.wombat_opts = {};
+
+  if (window && window._WBWombatInit) {
+    window._WBWombatInit(wbinfo);
+  }
+</script>
+{% else %}
+<script>
+  window.devicePixelRatio = 1;
+</script>
+{% endif %}
+
+{% if config.enable_flash_video_rewrite or config.transclusions_version == 1 %}
+<script src='{{ static_prefix }}/vidrw.js'> </script>
+
+{% elif config.transclusions_version == 2 %}
+<script src="{{ static_prefix }}/transclusions.js"> </script>
+
+{% endif %}
+
+{% if not is_framed %}
+
+{{ custom_banner_html }}
+
+{% endif %}
+
+{# Preserve Via's query parameters (via.client.openSidebar, etc.) across
+   in-iframe navigations. We use __viaRealSearch (captured before Wombat
+   overrides window.location) because Wombat makes location.search return
+   the original page's params (which don't include via.* params).
+   Wombat also overrides link.href to return the original URL, so we use
+   getAttribute('href') to get the actual DOM attribute (the proxied URL). #}
+<script>
+(function() {
+  var search = window.__viaRealSearch || '';
+  var viaParams = search
+    .slice(1).split('&')
+    .filter(function(p) { return p.indexOf('via.') === 0; })
+    .join('&');
+  if (!viaParams) return;
+  document.addEventListener('click', function(e) {
+    var link = e.target.closest ? e.target.closest('a') : null;
+    if (!link) return;
+    // Use getAttribute to bypass Wombat's href override
+    var rawHref = link.getAttribute('href');
+    if (!rawHref || rawHref.charAt(0) === '#') return;
+    // Append via params as-is to the raw href
+    var sep = rawHref.indexOf('?') > -1 ? '&' : '?';
+    link.setAttribute('href', rawHref + sep + viaParams);
+  }, true);
+})();
+</script>
+
+{% endautoescape %}
+
+<!-- End WB Insert -->

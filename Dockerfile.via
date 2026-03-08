@@ -1,0 +1,58 @@
+# Mirrors the upstream hypothesis/via Dockerfile
+# https://github.com/hypothesis/via/blob/main/Dockerfile
+
+# Stage 1: Build frontend assets
+FROM node:25.2.1-alpine AS frontend-build
+
+ARG VIA_REF=main
+
+RUN apk add --no-cache git
+WORKDIR /build
+RUN git clone --depth 1 --branch "$VIA_REF" https://github.com/hypothesis/via.git .
+
+ENV NODE_ENV=production
+RUN yarn install --immutable
+RUN yarn build
+
+# Stage 2: Build the rest of the app using build output from Stage 1.
+FROM python:3.11.13-slim-bullseye
+LABEL maintainer="Hypothes.is Project and contributors"
+
+RUN apt-get update && apt-get install --yes nginx nginx-extras gettext-base git supervisor libpq-dev \
+  && apt-get clean
+
+RUN groupadd --system hypothesis && useradd --system -g hypothesis --home /var/lib/hypothesis hypothesis
+WORKDIR /var/lib/hypothesis
+
+RUN chown -R hypothesis:hypothesis /etc/nginx/conf.d /var/log/nginx /var/lib/nginx /var/lib/hypothesis
+
+# Clone source again in stage 2 (can't share git clone across stages easily)
+ARG VIA_REF=main
+RUN git clone --depth 1 --branch "$VIA_REF" https://github.com/hypothesis/via.git /tmp/via
+
+# Install Python dependencies
+RUN apt-get install --yes gcc \
+  && pip install --no-cache-dir -U pip \
+  && pip install --no-cache-dir -r /tmp/via/requirements/prod.txt \
+  && apt-get remove --yes gcc \
+  && apt-get autoremove --yes
+
+# Copy nginx config (must happen before general source copy)
+RUN cp /tmp/via/conf/nginx/nginx.conf /etc/nginx/nginx.conf \
+    && cp -r /tmp/via/conf/nginx/includes /etc/nginx/includes \
+    && cp /tmp/via/conf/nginx/envsubst.conf.template /var/lib/hypothesis/nginx_envsubst.conf.template
+
+# Copy application source
+RUN cp -a /tmp/via/. /var/lib/hypothesis/ && rm -rf /tmp/via
+
+# Copy frontend assets from stage 1 (after source copy so build/ overwrites)
+COPY --from=frontend-build /build/build build
+
+# Ensure workdir writable by hypothesis user (must be after all copies)
+RUN chown -R hypothesis:hypothesis /var/lib/hypothesis
+
+ENV PYTHONPATH=/var/lib/hypothesis:$PYTHONPATH
+
+USER hypothesis
+
+CMD /usr/bin/envsubst '$${NGINX_SECURE_LINK_SECRET}' < /var/lib/hypothesis/nginx_envsubst.conf.template > /var/lib/hypothesis/nginx_envsubst.conf && /usr/bin/supervisord -c /var/lib/hypothesis/conf/supervisord.conf
