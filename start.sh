@@ -9,7 +9,7 @@ echo "Detected host IP: $HOST_IP"
 sed "s/__HOST_IP__/$HOST_IP/g" .env.template > .env
 echo "Generated .env with IP $HOST_IP"
 
-docker compose up -d "$@"
+docker compose up -d --build "$@"
 
 echo "Waiting for postgres..."
 docker compose exec -T postgres pg_isready -U postgres -d h -q --timeout=30

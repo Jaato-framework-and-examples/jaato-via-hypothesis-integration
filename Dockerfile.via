@@ -47,6 +47,9 @@ RUN cp -a /tmp/via/. /var/lib/hypothesis/ && rm -rf /tmp/via
 
 # Remove upstream decommission banner (not applicable to self-hosted)
 RUN sed -i '/<div class="decommission-banner"/,/<\/div>/d; /\.decommission-banner/,/}/d' \
+    /var/lib/hypothesis/via/templates/proxy.html.jinja2 \
+    /var/lib/hypothesis/via/templates/index.html.jinja2 \
+ && sed -i "/document.getElementById('decommission-banner')/,/observer\.observe/d" \
     /var/lib/hypothesis/via/templates/proxy.html.jinja2
 
 # Copy frontend assets from stage 1 (after source copy so build/ overwrites)
