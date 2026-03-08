@@ -1,5 +1,5 @@
 """
-Hypothesis Annotation Agent — polls for new annotations and replies via jaato-sdk.
+Hypothesis Annotation Agent — listens for annotations via WebSocket and replies via jaato-sdk.
 
 Usage:
     1. Ensure the Hypothesis stack is running (docker compose up)
@@ -9,15 +9,15 @@ Usage:
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import re
-import time
-from datetime import datetime, timezone
 from html.parser import HTMLParser
 from urllib.parse import urlparse
 
 import requests
+import websockets
 from dotenv import load_dotenv
 from jaato_sdk import IPCRecoveryClient
 from jaato_sdk.events import (
@@ -42,44 +42,35 @@ class HypothesisClient:
         self.api_url = api_url.rstrip("/")
         self.session = requests.Session()
         self.session.headers["Authorization"] = f"Bearer {token}"
+        self.token = token
         self.user = f"acct:{user}@{authority}"
+        # Reply waiters: annotation_id -> asyncio.Event + stored reply text
+        self._reply_waiters: dict[str, asyncio.Event] = {}
+        self._reply_texts: dict[str, str] = {}
 
-    def fetch_annotations(self, since: datetime) -> list[dict]:
-        """Return annotations updated after *since*, oldest-updated first."""
-        resp = self.session.get(
-            f"{self.api_url}/api/search",
-            params={
-                "sort": "updated",
-                "order": "asc",
-                "search_after": since.isoformat(),
-                "user": self.user,
-            },
-        )
-        resp.raise_for_status()
-        return resp.json().get("rows", [])
+    def ws_url(self) -> str:
+        """Derive the WebSocket URL from the API URL."""
+        return self.api_url.replace("http://", "ws://").replace("https://", "wss://") + "/ws"
 
-    def poll_for_reply(self, annotation_id: str, after: str,
-                        poll_min: float = 1, poll_max: float = 10) -> str:
-        """Block until a non-agent reply to *annotation_id* created after *after* appears."""
-        idle_cycles = 0
-        while True:
-            resp = self.session.get(
-                f"{self.api_url}/api/search",
-                params={
-                    "references": annotation_id,
-                    "sort": "created",
-                    "order": "asc",
-                    "search_after": after,
-                },
-            )
-            resp.raise_for_status()
-            for row in resp.json().get("rows", []):
-                if "jaato-annotation-agent" not in row.get("tags", []):
-                    return row.get("text", "")
-            idle_cycles += 1
-            interval = min(poll_min * (2 ** idle_cycles), poll_max)
-            log.debug("Waiting for reply to %s (%.1fs)", annotation_id, interval)
-            time.sleep(interval)
+    def notify_reply(self, ann: dict):
+        """Called by the WebSocket listener when a user reply arrives."""
+        refs = ann.get("references", [])
+        if not refs:
+            return
+        parent_id = refs[0]
+        if parent_id in self._reply_waiters:
+            self._reply_texts[parent_id] = ann.get("text", "")
+            self._reply_waiters[parent_id].set()
+
+    async def wait_for_reply(self, annotation_id: str) -> str:
+        """Block until a non-agent reply to *annotation_id* arrives via WebSocket."""
+        event = asyncio.Event()
+        self._reply_waiters[annotation_id] = event
+        try:
+            await event.wait()
+            return self._reply_texts.pop(annotation_id, "")
+        finally:
+            self._reply_waiters.pop(annotation_id, None)
 
     def create_reply(self, parent: dict, text: str) -> dict:
         """Post *text* as a threaded reply to *parent* annotation."""
@@ -149,8 +140,7 @@ class JaatoAgent:
                     log.info("Posted intermediate output (%d chars)", len(text))
                     parts.clear()
 
-                after = datetime.now(timezone.utc).isoformat()
-                user_reply = h_client.poll_for_reply(parent_ann["id"], after)
+                user_reply = await h_client.wait_for_reply(parent_ann["id"])
                 log.info("Got user reply for permission: %s", user_reply[:120])
                 await self.client.respond_to_permission(event.request_id, "comment")
 
@@ -164,8 +154,7 @@ class JaatoAgent:
                     log.info("Posted intermediate output (%d chars)", len(text))
                     parts.clear()
 
-                after = datetime.now(timezone.utc).isoformat()
-                user_reply = h_client.poll_for_reply(parent_ann["id"], after)
+                user_reply = await h_client.wait_for_reply(parent_ann["id"])
                 log.info("Got user reply for clarification: %s", user_reply[:120])
                 await self.client.respond_to_clarification(event.request_id, user_reply)
 
@@ -236,79 +225,100 @@ def extract_quote(annotation: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Main loop
+# WebSocket listener
 # ---------------------------------------------------------------------------
+
+SUBSCRIBE_FILTER = json.dumps({
+    "filter": {
+        "match_policy": "include_any",
+        "clauses": [
+            {"field": "/group", "operator": "one_of", "value": ["__world__"]},
+        ],
+        "actions": {"create": True, "update": True, "delete": True},
+    },
+})
+
+
+async def process_annotation(ann: dict, h: HypothesisClient, agent: JaatoAgent):
+    """Process a single annotation: discover repo, run through jaato, post reply."""
+    ann_id = ann["id"]
+    quote = extract_quote(ann)
+    instruction = ann.get("text", "")
+    log.info("New annotation %s: %s", ann_id, instruction[:80])
+
+    ann_uri = ann["uri"]
+    repo_url = discover_repo(ann_uri)
+    page_path = urlparse(ann_uri).path.lstrip("/") or None
+
+    response = await agent.process(instruction, quote, h, ann,
+                                   repo_url=repo_url, page_path=page_path)
+    h.create_reply(ann, response)
+    log.info("Replied to %s (%d chars)", ann_id, len(response))
+
+
+async def listen(h: HypothesisClient, agent: JaatoAgent):
+    """Connect to the Hypothesis WebSocket and process annotation events."""
+    ws_url = h.ws_url()
+    headers = {"Authorization": f"Bearer {h.token}"}
+    log.info("Connecting to %s as %s", ws_url, h.user)
+
+    # Queue decouples WebSocket reading from annotation processing, so the
+    # reader can keep delivering reply notifications while an annotation is
+    # being processed (e.g. during permission/clarification waits).
+    work_queue: asyncio.Queue[dict] = asyncio.Queue()
+
+    async def reader(ws):
+        await ws.send(SUBSCRIBE_FILTER)
+        log.info("Subscribed to group __world__")
+
+        async for raw in ws:
+            msg = json.loads(raw)
+            if msg.get("type") != "annotation-notification":
+                continue
+
+            action = msg.get("options", {}).get("action")
+            for ann in msg.get("payload", []):
+                if "jaato-annotation-agent" in ann.get("tags", []):
+                    continue
+
+                if action == "delete":
+                    continue
+
+                if ann.get("references"):
+                    h.notify_reply(ann)
+                    continue
+
+                await work_queue.put(ann)
+
+    async def worker():
+        while True:
+            ann = await work_queue.get()
+            try:
+                await process_annotation(ann, h, agent)
+            except Exception:
+                log.exception("Error processing annotation %s", ann.get("id"))
+
+    async for ws in websockets.connect(ws_url, additional_headers=headers):
+        try:
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(reader(ws))
+                tg.create_task(worker())
+        except* websockets.ConnectionClosed:
+            log.warning("WebSocket connection closed, reconnecting...")
+
 
 async def main():
     api_url = os.environ["H_API_URL"]
     token = os.environ["H_API_TOKEN"]
     user = os.environ["ANNOTATION_AGENT_USER"]
     authority = os.environ["ANNOTATION_AGENT_AUTHORITY"]
-    poll_interval = int(os.environ.get("ANNOTATION_POLL_INTERVAL", "10"))
 
     h = HypothesisClient(api_url, token, user, authority)
     agent = JaatoAgent()
     await agent.connect()
 
-    poll_min = 1
-    poll_max = poll_interval
-
-    since = datetime.now(timezone.utc)
-    processed: dict[str, str] = {}  # annotation id -> last processed "updated" timestamp
-    log.info("Polling %s as %s (adaptive %ds–%ds)", api_url, h.user, poll_min, poll_max)
-
-    idle_cycles = 0
     try:
-        while True:
-            try:
-                annotations = h.fetch_annotations(since)
-                found_work = False
-
-                for ann in annotations:
-                    if "jaato-annotation-agent" in ann.get("tags", []):
-                        continue
-
-                    ann_id = ann["id"]
-                    ann_updated = ann["updated"]
-
-                    if processed.get(ann_id) == ann_updated:
-                        continue  # already processed this version
-
-                    found_work = True
-                    quote = extract_quote(ann)
-                    instruction = ann.get("text", "")
-                    is_edit = ann_id in processed
-                    log.info(
-                        "%s %s: %s",
-                        "Edited annotation" if is_edit else "New annotation",
-                        ann_id,
-                        instruction[:80],
-                    )
-
-                    ann_uri = ann["uri"]
-                    repo_url = discover_repo(ann_uri)
-                    page_path = urlparse(ann_uri).path.lstrip("/") or None
-
-                    response = await agent.process(instruction, quote, h, ann,
-                                                   repo_url=repo_url, page_path=page_path)
-                    h.create_reply(ann, response)
-                    log.info("Replied to %s (%d chars)", ann_id, len(response))
-
-                    processed[ann_id] = ann_updated
-                    since = datetime.fromisoformat(ann_updated)
-
-                if found_work:
-                    idle_cycles = 0
-                else:
-                    idle_cycles += 1
-            except KeyboardInterrupt:
-                raise
-            except Exception:
-                log.exception("Error during poll cycle")
-
-            interval = min(poll_min * (2 ** idle_cycles), poll_max)
-            log.debug("Next poll in %.1fs (idle_cycles=%d)", interval, idle_cycles)
-            await asyncio.sleep(interval)
+        await listen(h, agent)
     except (KeyboardInterrupt, asyncio.CancelledError):
         log.info("Shutting down")
     finally:

@@ -1,3 +1,4 @@
 jaato-sdk
 requests
 python-dotenv
+websockets

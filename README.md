@@ -84,7 +84,7 @@ Copy the returned UUID into `CLIENT_OAUTH_ID` in `.env.template`, then re-run `.
 
 ## Annotation Agent
 
-The agent polls the Hypothesis API for new annotations and replies using a Jaato-connected LLM.
+The agent listens for new annotations in real time via the Hypothesis WebSocket API and replies using a Jaato-connected LLM.
 
 ### Source Repository Discovery
 
