@@ -10,7 +10,7 @@ The current `annotation_agent.py` (345 lines of custom Python) does two jobs:
 
 2. **Integration glue** — discovers source repos from `<link rel="vcs-git">`,
    builds prompts, posts replies via the Hypothesis REST API, and auto-approves
-   tool permissions in a controlled environment.
+   tool permissions.
 
 The agent runs non-interactively — this is a headless daemon, not a
 conversational assistant. The model should never request clarification; it works
@@ -67,7 +67,7 @@ declaratively:
 | Reconnect on `ConnectionClosed`    | `reconnect: true` in config                  |
 | Message parsing / routing          | Handled in system prompt                     |
 
-## Three Approaches
+## Two Approaches
 
 ### Approach 1: Current `annotation_agent.py` (self-contained)
 
@@ -75,115 +75,94 @@ declaratively:
 prompt building, REST API replies, permission auto-approval. No dependency on
 the `ws_client` plugin.
 
-**Pros:** Self-contained, battle-tested, no plugin dependency.
+```bash
+python annotation_agent.py
+```
+
+**Pros:** Self-contained, no plugin dependency, deterministic filtering.
 **Cons:** Significant boilerplate for WebSocket connect/subscribe/reconnect.
 
-### Approach 2: ws_client plugin + thin adapter (`annotation_agent_simplified.py`)
+### Approach 2: Profile + prompt via Jaato TUI (zero custom code)
 
-~130 lines of Python. The ws_client plugin handles the WebSocket lifecycle.
-The adapter handles:
-
-1. Auto-approving tool permissions (controlled environment)
-2. Posting replies via the Hypothesis REST API
-3. Filtering/routing incoming annotation messages (own replies, deletes, etc.)
-
-The TUI client runs with `--headless`, so no clarification events occur.
+No Python script at all. A single profile
+(`.jaato/profiles/hypothesis-annotation-agent.json`) contains everything: the
+ws_client plugin config and system instructions. The Jaato TUI client runs the
+agent directly — auto-starting the server if needed.
 
 ```bash
-python -m server --profile hypothesis-annotation-agent --daemon
-jaato --headless  # or: python annotation_agent_simplified.py
+jaato --headless --profile hypothesis-annotation-agent
 ```
 
-**Pros:** 60% less code, WebSocket lifecycle fully managed by plugin.
-**Cons:** Requires ws_client plugin, still needs a Python adapter for REST replies.
+That's it. The ws_client plugin connects to the Hypothesis WebSocket, delivers
+incoming annotation events as prompts, and the system instructions tell the
+agent how to filter, process, and reply (via `curl` through the `cli` tool).
 
-### Approach 3: Pure profile + prompt via TUI client (zero custom code)
-
-No Python adapter at all. The profile
-(`.jaato/profiles/hypothesis-annotation-agent-headless.json`) contains
-everything: plugin config, system instructions, and `"headless": true`. The
-agent uses `cli` with `curl` to POST replies to the Hypothesis API.
-
-```bash
-python -m server --profile hypothesis-annotation-agent-headless --daemon
-jaato --headless
-```
-
-The TUI client connects to the daemon with `--headless`. All logic lives in the system
-prompt: filtering annotations, discovering repos via `web_fetch`, posting
-replies via `curl`.
-
-**Pros:** Zero custom code, fully declarative, entire agent is a JSON file.
+**Pros:** Zero custom code, fully declarative, entire agent is a JSON profile +
+a one-liner command.
 **Cons:** Reliability depends on the LLM following the prompt protocol
-perfectly every time. The `curl` reply format must be correct (JSON escaping,
-field mapping). Filtering logic is prompt-dependent rather than deterministic.
+perfectly every time — correct JSON escaping in `curl`, correct annotation
+filtering, correct field mapping. Prompt-dependent rather than deterministic.
 
-## What Still Needs Custom Code (Approach 2 only)
+## What the Profile Handles
+
+Everything that was previously custom Python:
 
 ### 1. Annotation Filtering
 
-The adapter filters out:
-- Annotations tagged `jaato-annotation-agent` (the agent's own replies)
-- Delete actions
-- Reply annotations
+System prompt instructs the agent to ignore:
+- Annotations tagged `jaato-annotation-agent` (its own replies)
+- `delete` actions
+- Reply annotations (non-empty `references` array)
 
-**Verdict:** Deterministic Python is more reliable than prompt-based filtering.
-In Approach 3, this is handled by prompt instructions — workable but less
-reliable for edge cases.
+In Approach 1 this is deterministic Python. In Approach 2 it's prompt-dependent
+— workable but less reliable for edge cases.
 
-### 2. REST API Calls (Posting Replies)
+### 2. Repo Discovery
 
-Currently uses `requests.Session` to POST annotation replies.
+System prompt instructs the agent to fetch the annotated URI via `web_fetch`
+and extract the `<link rel="vcs-git">` tag. Fully equivalent to the Python
+implementation.
 
-**Verdict:** In Approach 2, handled by the adapter. In Approach 3, replaced by
-`curl` via the `cli` tool — the system prompt includes the exact `curl` command
-template.
+### 3. Posting Replies
 
-### 3. Repo Discovery
-
-Fetching the annotated page's HTML and parsing `<link rel="vcs-git">` to find
-the backing repository.
-
-**Verdict:** Fully replaceable by `web_fetch` plugin + system prompt in both
-Approach 2 and 3.
+System prompt provides a `curl` template. The agent uses `cli` to POST
+annotation replies to the Hypothesis API. In Approach 1 this is handled by
+`requests.Session` — more reliable for JSON escaping.
 
 ## Comparison
 
-| Approach                           | Lines of code | Reliability | Complexity | Dependency on ws_client |
-|------------------------------------|---------------|-------------|------------|-------------------------|
-| 1. Current `annotation_agent.py`   | ~345          | High        | Medium     | None (self-contained)   |
-| 2. ws_client + thin adapter        | ~130          | High        | Low        | Plugin must be available |
-| 3. Pure profile + prompt (TUI)     | 0 (config)    | Medium      | Low        | Plugin must be available |
+| Aspect                    | Approach 1 (custom Python)       | Approach 2 (profile + TUI)         |
+|---------------------------|----------------------------------|------------------------------------|
+| Lines of custom code      | ~345                             | 0                                  |
+| WebSocket lifecycle       | Custom (websockets lib)          | ws_client plugin                   |
+| Annotation filtering      | Deterministic Python             | Prompt-dependent                   |
+| Reply posting             | `requests.Session`               | `curl` via `cli` tool              |
+| Repo discovery            | Custom HTML parser               | `web_fetch` + prompt               |
+| Clarification             | Not used                         | Blocked by `--headless`            |
+| Plugin dependency         | None                             | ws_client                          |
+| Startup command           | `python annotation_agent.py`     | `jaato --headless --profile ...`   |
 
 ## Recommendation
 
-**Approach 2** (ws_client plugin + thin adapter) is the best tradeoff for
-production use. The WebSocket lifecycle is fully managed by the plugin, while
-filtering and REST replies remain deterministic Python.
+**Approach 2 is the target.** Once the `ws_client` plugin ships, the entire
+annotation agent reduces to a profile JSON and a one-liner command. The
+345-line Python script becomes unnecessary.
 
-**Approach 3** (pure profile + prompt) is provided for comparison and is viable
-for low-stakes or experimental use. Its main risk is that `curl`-based reply
-posting depends on the LLM correctly escaping JSON every time. For an
-unattended daemon, deterministic code for the reply POST is preferred.
-
-Both approaches use the TUI's `--headless` flag — the model never requests
-clarification.
+The main risk is reliability of prompt-dependent operations (JSON escaping in
+`curl`, annotation filtering). This should be validated in a staging
+environment before replacing the Python agent in production.
 
 ### Migration Path
 
-1. **Now**: Keep `annotation_agent.py` (Approach 1) as the production
-   implementation.
-2. **When ws_client ships**: Switch to `annotation_agent_simplified.py`
-   (Approach 2) for a 60% code reduction with the same reliability.
-3. **Experimental**: Try the pure TUI approach (Approach 3) using
-   `hypothesis-annotation-agent-headless.json` to validate prompt-only
-   reliability in a staging environment.
+1. **Now**: Keep `annotation_agent.py` as the production implementation.
+2. **When ws_client ships**: Test the profile-only approach
+   (`jaato --headless --profile hypothesis-annotation-agent`) against the same
+   annotation workload.
+3. **When validated**: Drop `annotation_agent.py` entirely.
 
 ## Files
 
-| File | Approach |
-|------|----------|
-| `annotation_agent.py` | 1 — self-contained |
-| `annotation_agent_simplified.py` | 2 — thin adapter |
-| `.jaato/profiles/hypothesis-annotation-agent.json` | Profile for Approach 2 |
-| `.jaato/profiles/hypothesis-annotation-agent-headless.json` | Profile for Approach 3 (pure TUI) |
+| File | Purpose |
+|------|---------|
+| `annotation_agent.py` | Current self-contained implementation (Approach 1) |
+| `.jaato/profiles/hypothesis-annotation-agent.json` | Profile for the TUI-based approach (Approach 2) |
