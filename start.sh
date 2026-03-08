@@ -73,5 +73,30 @@ echo "Annotate any page by visiting:"
 echo "  http://${HOST_IP}:9083/<URL_TO_ANNOTATE>"
 echo "Or open http://${HOST_IP}:9083 and paste a URL."
 echo ""
-echo "Starting annotation agent..."
-python annotation_agent.py
+echo "How do you want to run the annotation agent?"
+echo "  1) Standalone script (annotation_agent.py)"
+echo "  2) Jaato TUI profile (headless)"
+read -rp "Choose [1/2]: " AGENT_MODE
+
+if [ "$AGENT_MODE" = "2" ]; then
+    # Install jaato-sdk and jaato-tui (safe to upgrade)
+    pip install --upgrade --extra-index-url https://test.pypi.org/simple/ jaato-sdk jaato-tui
+
+    # Install jaato-server only if not already installed
+    if ! pip show jaato-server > /dev/null 2>&1; then
+        pip install --upgrade --extra-index-url https://test.pypi.org/simple/ jaato-server
+    fi
+
+    # Start jaato-server if not already running
+    if ! jaato-server --status > /dev/null 2>&1; then
+        echo "Starting jaato-server..."
+        jaato-server &
+        sleep 2
+    fi
+
+    echo "Starting annotation agent via Jaato profile..."
+    jaato --new-session --profile hypothesis-annotation-agent --headless
+else
+    echo "Starting annotation agent..."
+    python annotation_agent.py
+fi
