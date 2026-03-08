@@ -49,38 +49,32 @@ cd jaato-via-hypothesis-integration
 
 ## First-Time Setup
 
-After the first `./start.sh`, initialize the Hypothesis database:
+Handled automatically. On the first run, `start.sh` detects an uninitialized database and calls `init.sh`, which:
 
-```bash
-# Create schema and search index
-docker compose run --rm h hypothesis init-db
-docker compose run --rm h hypothesis search reindex
+1. Creates the DB schema and search index
+2. Prompts you for a username, email, and password
+3. Creates the user with the correct authority
+4. Generates the OAuth client and updates `.env.template`
 
-# Create your user (replace YOUR_USERNAME)
-docker compose run --rm h hypothesis user add --username YOUR_USERNAME --email you@example.com --password YOUR_PASSWORD
+Just run `./start.sh` and follow the prompts. You can also re-run `./init.sh <HOST_IP>` independently if needed.
+
+## Usage
+
+Open Via in your browser to annotate any web page with the Hypothesis client injected:
+
+```
+http://<HOST_IP>:9083/<URL_TO_ANNOTATE>
 ```
 
-The `hypothesis user add` command sets `authority=localhost`, which must be corrected. Get your host IP from `.env` (`grep AUTHORITY .env`) and run:
+For example, to annotate `https://example.com`:
 
-```bash
-docker compose exec postgres psql -U postgres -d h -c "
-  UPDATE \"user\" SET authority='YOUR_HOST_IP', activation_date=NOW() WHERE username='YOUR_USERNAME';
-  UPDATE \"group\" SET authority='YOUR_HOST_IP' WHERE pubid='__world__';
-"
+```
+http://192.168.50.212:9083/https://example.com
 ```
 
-Create the OAuth client for the annotation sidebar:
+You can also visit `http://<HOST_IP>:9083` directly — the Via front page lets you paste a URL to annotate.
 
-```bash
-docker compose exec postgres psql -U postgres -d h -c "
-  INSERT INTO authclient (name, authority, grant_type, response_type, redirect_uri, trusted)
-  VALUES ('Hypothesis Client', 'YOUR_HOST_IP', 'authorization_code', 'code',
-          'http://YOUR_HOST_IP:5000/app/oauth/authorize', true)
-  RETURNING id;
-"
-```
-
-Copy the returned UUID into `CLIENT_OAUTH_ID` in `.env.template`, then re-run `./start.sh`.
+Log in with the credentials you created during first-time setup. Select text on the proxied page to create annotations.
 
 ## Annotation Agent
 
