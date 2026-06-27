@@ -92,16 +92,30 @@ class HypothesisClient:
 
 class JaatoAgent:
     def __init__(self):
-        self.client = IPCRecoveryClient()
+        # Lifecycle-only facade migration: IPCRecoveryClient.session() owns
+        # connect + create_session + disconnect. The per-turn send + event loop
+        # in process() stays on the low-level client (self.session.client) — a
+        # turn can raise a ClarificationInputModeEvent, for which the facade's
+        # ask()/on_permission path has no equivalent (it would hang).
+        self._session_ctx = None
+        self.session = None
 
     async def connect(self):
-        await self.client.connect()
-        session_id = await self.client.create_session("annotation-agent")
-        log.info("Connected to jaato server, session %s", session_id)
+        kwargs = {"agent": "annotation-agent"}
+        # Honour a socket override (e.g. reuse a running daemon for e2e).
+        socket_path = os.environ.get("JAATO_SOCKET")
+        if socket_path:
+            kwargs["socket_path"] = socket_path
+        self._session_ctx = IPCRecoveryClient.session(**kwargs)
+        # Enter/exit the context manually so a single session is reused across
+        # every annotation (wrapping each annotation in its own session() would
+        # drop conversation continuity).
+        self.session = await self._session_ctx.__aenter__()
+        log.info("Connected to jaato server, session %s", self.session.session_id)
 
     async def close(self):
         log.info("Closing jaato session")
-        await self.client.close()
+        await self._session_ctx.__aexit__(None, None, None)
 
     async def process(self, instruction: str, context: str,
                        h_client: HypothesisClient, parent_ann: dict,
@@ -117,11 +131,15 @@ class JaatoAgent:
         parts_prompt.append(f"Context (selected text from the page):\n{context}")
         parts_prompt.append(f"Instruction:\n{instruction}")
         prompt = "\n".join(parts_prompt)
-        await self.client.send_message(prompt)
+        # Drive the turn on the low-level client under the facade session, so the
+        # mid-turn PermissionInputMode/ClarificationInputMode loop below keeps the
+        # full event API (no facade equivalent for clarifications).
+        client = self.session.client
+        await client.send_message(prompt)
 
         parts: list[str] = []
 
-        async for event in self.client.events():
+        async for event in client.events():
             log.debug("Event: %s", type(event).__name__)
 
             if isinstance(event, AgentOutputEvent):
@@ -142,7 +160,7 @@ class JaatoAgent:
 
                 user_reply = await h_client.wait_for_reply(parent_ann["id"])
                 log.info("Got user reply for permission: %s", user_reply[:120])
-                await self.client.respond_to_permission(event.request_id, "comment")
+                await client.respond_to_permission(event.request_id, "comment")
 
             elif isinstance(event, ClarificationInputModeEvent):
                 log.info("Clarification requested (request_id=%s, tool=%s)",
@@ -156,7 +174,7 @@ class JaatoAgent:
 
                 user_reply = await h_client.wait_for_reply(parent_ann["id"])
                 log.info("Got user reply for clarification: %s", user_reply[:120])
-                await self.client.respond_to_clarification(event.request_id, user_reply)
+                await client.respond_to_clarification(event.request_id, user_reply)
 
             elif isinstance(event, ErrorEvent):
                 log.error("Agent error: %s", event)
